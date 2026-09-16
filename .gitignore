@@ -1,0 +1,39 @@
+# ---- 构建产物 ----
+# 编译出来的目标文件、可执行文件、烧录镜像和内存映射表都不入库。
+build/
+*.o
+*.elf
+*.bin
+*.map
+*.hex
+*.lst
+*.su
+
+# ---- macOS ----
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+compile_commands.json
+.cache/
+
+# ---- 调试器 ----
+# SEGGER J-Link 会在当前目录留下日志和配置
+JLinkLog.txt
+JLinkSettings.ini
+*.jlink.log
+
+# ---- 工具链 / 环境 ----
+.venv/
+venv/
+__pycache__/
+*.pyc

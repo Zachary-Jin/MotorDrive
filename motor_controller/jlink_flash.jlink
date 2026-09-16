@@ -1,0 +1,7 @@
+r
+h
+loadbin motor_controller.bin, 0x08000000
+verifybin motor_controller.bin, 0x08000000
+r
+g
+q
