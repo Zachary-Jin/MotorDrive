@@ -102,9 +102,15 @@ cd MotorDrive
 
 > **不要用 `git clone --recurse-submodules`。**
 > STM32CubeF1 内部还挂着一堆嵌套 submodule（各评估板的 BSP、FreeRTOS、LwIP、
-> FatFs、USB 库……），本工程一个都用不到，全递归下来是 200 MB 以上。
-> `bootstrap.sh` 只拉编译真正需要的那两个（HAL 驱动、CMSIS 器件头），约 18 MB。
-> 脚本最后会逐个校验编译用到的文件是否到位。
+> FatFs、USB 库……），本工程一个都用不到。`bootstrap.sh` 只拉编译真正需要的
+> 那两个（HAL 驱动、CMSIS 器件头），最后会逐个校验文件是否到位。
+>
+> STM32CubeF1 本身约 **240 MB**（绝大部分是官方仓库的完整工作区，历史只占约
+> 40 MB），首次拉取需要几分钟，属正常现象。
+> **不要改用 `--depth 1` 浅克隆来省这几十 MB** —— 实测 CubeF1 一旦浅克隆，
+> 它的嵌套 submodule 只会建出一个空目录（里面仅剩一个 `.git` 文件），
+> `git submodule status` 却报告"已检出"，一直要等到编译报
+> `stm32f1xx.h: No such file or directory` 才会暴露。详见 `bootstrap.sh` 注释。
 
 ### 2. 安装工具链
 
