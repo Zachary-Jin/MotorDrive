@@ -5,30 +5,53 @@
 #define AUTO_START_DIRECTION 1 /* 1 = 上电先正转, -1 = 先反转 */
 
 /* HC-160A S2 dual H-bridge.
- * Channel 1: direction inputs "A"/"B", speed input "PWM1" (PA8).
- * Channel 2: direction inputs "a"/"b", speed input "PWM2" (PA11).
+ * Channel 1: direction inputs "A"/"B", speed input "P" (PA8).
+ * Channel 2: direction inputs "a"/"b", speed input "P" (PA11).
  * Vendor table: A=1,B=0 forward; A=0,B=1 reverse; A=0,B=0 brake; A=1,B=1 UNDEFINED.
- * No PWM is generated anywhere: both speed inputs are written once in GPIO_Init()
- * as static DC levels and never touched again.
  *
- * These six pins are deliberately all 5V-tolerant (FT) parts of the F103. PA0-PA7,
- * PB0, PB1 and PC13-PC15 are NOT FT, and every GPIO is a floating input for the
- * ~2-3 ms between reset release and GPIO_Init(), so an external 5V pull-up on the
- * driver board would exceed the absolute maximum rating on a non-FT pin. */
+ * The speed inputs take a PWM SQUARE WAVE, not a DC level. Vendor text, verbatim:
+ *   "PA为PWM波输入；频率最高为60KHZ；占空比最高达98%"
+ * A static HIGH is 100% duty, which is outside that 98% limit, and the module then
+ * refuses to drive the bridge at all - measured with a static high on both speed
+ * pins: both motor terminals sat at 0V no matter what the direction pins did, and
+ * jumpering the speed pin straight to the module's own 5V output changed nothing.
+ * So both speed inputs are driven by TIM1 as real square waves at the vendor's
+ * maximum permitted duty. There is still no speed control in this program: the
+ * duty cycle is a compile-time constant and nothing ever changes it at runtime.
+ *
+ * These six pins are all 5V-tolerant (FT) parts of the F103. PA0-PA7, PB0, PB1 and
+ * PC13-PC15 are NOT FT, and every GPIO is a floating input for the ~2-3 ms between
+ * reset release and GPIO_Init(). Measured on this board there is NO 5V pull-up on
+ * the control inputs (they rest at ~0.2V with the module powered), so a non-FT pin
+ * would in fact have been fine here. The FT choice is a conservative one, not a fix
+ * for an observed fault - but the cost of keeping it is zero, so keep it. */
 #define M1_DIR_A_PIN GPIO_PIN_8 /* ch1 direction "A" (was PB0) */
 #define M1_DIR_B_PIN GPIO_PIN_9 /* ch1 direction "B" (was PB1) */
 #define M2_DIR_A_PIN GPIO_PIN_6 /* ch2 direction "a" */
 #define M2_DIR_B_PIN GPIO_PIN_7 /* ch2 direction "b" */
 #define DIR_PORT GPIOB          /* all four direction pins must share this port: dir_write() relies on one BSRR store */
-#define M1_PWM_PIN GPIO_PIN_8   /* ch1 speed, PA8: static HIGH = full speed */
-#define M2_PWM_PIN GPIO_PIN_11  /* ch2 speed, PA11: static HIGH = full speed */
+#define M1_PWM_PIN GPIO_PIN_8   /* ch1 speed "P", PA8 = TIM1_CH1 */
+#define M2_PWM_PIN GPIO_PIN_11  /* ch2 speed "P", PA11 = TIM1_CH4 */
 #define PWM_PORT GPIOA
+
+/* Speed-input PWM. 15 kHz is what the vendor's own wiring diagram annotates the "P"
+ * pins with ("15K方波"); the module accepts up to 60 kHz. Duty is pinned to the 98%
+ * maximum the vendor specifies: at 98% the motor sees 0.98 x Vs, which is full speed
+ * for any practical purpose, while staying inside spec. Do NOT raise this to 100% -
+ * that is precisely the failure this rewrite exists to fix. Halving it is a valid
+ * way to make the motors run at roughly half speed, but it is not a calibrated
+ * speed control. */
+#define PWM_FREQ_HZ 15000U
+#define PWM_DUTY_PERCENT 98U
+#define PWM_TIMER_CLOCK_HZ 64000000U /* APB2 prescaler is 1, so TIM1CLK = PCLK2 = SYSCLK */
+#define PWM_ARR (PWM_TIMER_CLOCK_HZ / PWM_FREQ_HZ - 1U)          /* 4265 -> 15.0 kHz */
+#define PWM_CCR ((PWM_ARR + 1U) * PWM_DUTY_PERCENT / 100U)       /* 4180 -> 98.0 % */
 #define LIMIT_DOWN_PIN GPIO_PIN_10
 #define LIMIT_UP_PIN GPIO_PIN_11
 #define BUTTON_UP_PIN GPIO_PIN_12
 #define BUTTON_DOWN_PIN GPIO_PIN_13
 
-/* Debug switch: set to 0 to bench-test with channel 2 parked (PWM2 low, a/b braked). */
+/* Debug switch: set to 0 to bench-test with channel 2 parked (0% duty on TIM1_CH4, a/b braked). */
 #define CHANNEL_B_ENABLED 1
 
 /* Milliseconds to brake (A=B=0) before each reversal. 0 = reverse immediately, no dead
@@ -39,7 +62,8 @@
  * Raise to 200U if the supply sags on reversal (UART repeating "RESET: POR/BROWNOUT"). */
 #define REVERSE_DEAD_TIME_MS 0U
 
-TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim1; /* PWM only: the two HC-160A S2 speed inputs */
+TIM_HandleTypeDef htim3; /* 1 kHz millisecond tick only */
 UART_HandleTypeDef huart1;
 static volatile uint8_t motor_ready = 0U;
 static volatile int8_t a_direction = 0;
@@ -55,6 +79,7 @@ static volatile int8_t pending_direction = AUTO_START_DIRECTION;
 
 static void SystemClock_Config(void);
 static void GPIO_Init(void);
+static void TIM1_PWM_Init(void);
 static void TIM3_Init(void);
 static void USART1_Init(void);
 static void motor_stop_a(void);
@@ -103,8 +128,8 @@ static void dir_write(uint16_t pin_a, uint16_t pin_b, int8_t direction)
 }
 
 /* "Stop" writes A=B=0, which on the HC-160A S2 is a BRAKE (windings shorted through
- * the low-side FETs), not a de-energise: the speed input stays HIGH, so the bridge
- * remains live and will get warm if the load back-drives it. */
+ * the low-side FETs), not a de-energise: the speed input keeps switching at 98%, so
+ * the bridge remains live and will get warm if the load back-drives it. */
 static void motor_stop_a(void)
 {
   a_direction = 0;
@@ -212,6 +237,7 @@ int main(void)
   HAL_Init();
   SystemClock_Config();
   GPIO_Init();
+  TIM1_PWM_Init();
   TIM3_Init();
   USART1_Init();
   motor_ready = 1U;
@@ -219,7 +245,8 @@ int main(void)
   motor_stop_b();
 
   print_reset_cause();
-  uart_puts("auto reverse: both channels, 5s forward / 5s reverse; r=auto s=stop\r\n");
+  uart_puts("speed inputs: TIM1 PWM 15 kHz, 98% duty; r=auto s=stop\r\n");
+  uart_puts("auto reverse: both channels, 5s forward / 5s reverse\r\n");
 
   while (1) {
     uint8_t up = (HAL_GPIO_ReadPin(GPIOB, BUTTON_UP_PIN) == GPIO_PIN_RESET);
@@ -290,20 +317,58 @@ static void GPIO_Init(void)
   gpio.Mode = GPIO_MODE_INPUT; gpio.Pull = GPIO_PULLUP; HAL_GPIO_Init(GPIOB, &gpio);
   /* Reset Pull: HAL_GPIO_Init() uses it to pick the initial ODR level for output pins,
    * so leaving the pull-up from the block above in place would make the startup level
-   * depend on HAL internals. The explicit writes below are the real source of truth. */
-  gpio.Pin = M1_PWM_PIN | M2_PWM_PIN; gpio.Mode = GPIO_MODE_OUTPUT_PP; gpio.Speed = GPIO_SPEED_FREQ_HIGH; gpio.Pull = GPIO_NOPULL; HAL_GPIO_Init(PWM_PORT, &gpio);
-  /* The only two writes to the speed inputs in the entire program: both channels run
-   * at full speed. Nothing else may touch these pins - that is what "no PWM" means here. */
-#if CHANNEL_B_ENABLED
-  HAL_GPIO_WritePin(PWM_PORT, M1_PWM_PIN | M2_PWM_PIN, GPIO_PIN_SET);
-#else
-  HAL_GPIO_WritePin(PWM_PORT, M1_PWM_PIN, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(PWM_PORT, M2_PWM_PIN, GPIO_PIN_RESET);
-#endif
+   * depend on HAL internals. The direction pins then default to ODR = 0, i.e. brake,
+   * which is what we want before auto mode picks a direction. */
+  /* The two speed inputs are timer outputs, not GPIOs: alternate-function push-pull,
+   * driven by TIM1_CH1/CH4 from TIM1_PWM_Init(). Nothing in this program ever writes
+   * these pins as GPIOs. With the timer not yet started they sit low, so the module
+   * sees "no valid PWM" during startup - which, per the vendor text above, means the
+   * bridge stays off. That is the safe direction for it to fail in. */
+  gpio.Pin = M1_PWM_PIN | M2_PWM_PIN; gpio.Mode = GPIO_MODE_AF_PP; gpio.Speed = GPIO_SPEED_FREQ_HIGH; gpio.Pull = GPIO_NOPULL; HAL_GPIO_Init(PWM_PORT, &gpio);
   gpio.Pin = GPIO_PIN_9; gpio.Mode = GPIO_MODE_AF_PP; gpio.Speed = GPIO_SPEED_FREQ_HIGH; HAL_GPIO_Init(GPIOA, &gpio);
   gpio.Pin = GPIO_PIN_10; gpio.Mode = GPIO_MODE_INPUT; gpio.Pull = GPIO_NOPULL; HAL_GPIO_Init(GPIOA, &gpio);
   gpio.Pin = GPIO_PIN_13; gpio.Mode = GPIO_MODE_OUTPUT_PP; gpio.Speed = GPIO_SPEED_FREQ_LOW; HAL_GPIO_Init(GPIOC, &gpio);
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+}
+
+/* TIM1_CH1 (PA8) and TIM1_CH4 (PA11) drive the two HC-160A S2 speed inputs.
+ * Runs free for the whole life of the program at a fixed 15 kHz / 98% duty; nothing
+ * ever reprograms it. The direction pins alone decide forward / reverse / brake. */
+static void TIM1_PWM_Init(void)
+{
+  TIM_OC_InitTypeDef oc = {0};
+
+  __HAL_RCC_TIM1_CLK_ENABLE();
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0U;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = PWM_ARR;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0U;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) Error_Handler();
+
+  oc.OCMode = TIM_OCMODE_PWM1;
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
+  oc.OCIdleState = TIM_OCIDLESTATE_RESET;
+
+  oc.Pulse = PWM_CCR; /* channel 1: full speed */
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+
+  /* Channel 2: 0% duty when bench-testing a single motor. Parking it by stopping the
+   * timer is not an option - TIM1 is shared, so that would kill channel 1 as well. */
+#if CHANNEL_B_ENABLED
+  oc.Pulse = PWM_CCR;
+#else
+  oc.Pulse = 0U;
+#endif
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
+
+  /* HAL_TIM_PWM_Start() also sets MOE for TIM1 (a break-capable timer); without it the
+   * outputs stay disabled no matter what the compare registers say. */
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
 }
 
 static void TIM3_Init(void)
